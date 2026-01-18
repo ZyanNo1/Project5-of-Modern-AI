@@ -192,16 +192,18 @@ def plot_training_curves(history: Dict[str, List[float]], out_path: str):
     Saves a PNG with loss and metric curves side by side.
     """
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    epochs = range(1, len(next(iter(history.values()))) + 1)
+
+    def _epochs_for(key: str):
+        return range(1, len(history.get(key, [])) + 1)
 
     plt.figure(figsize=(10, 4))
 
     # Loss subplot
     plt.subplot(1, 2, 1)
-    if "train_loss" in history:
-        plt.plot(epochs, history["train_loss"], label="train_loss", marker='o')
-    if "val_loss" in history:
-        plt.plot(epochs, history["val_loss"], label="val_loss", marker='o')
+    if "train_loss" in history and len(history["train_loss"]) > 0:
+        plt.plot(list(_epochs_for("train_loss")), history["train_loss"], label="train_loss", marker="o")
+    if "val_loss" in history and len(history["val_loss"]) > 0:
+        plt.plot(list(_epochs_for("val_loss")), history["val_loss"], label="val_loss", marker="o")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.legend()
@@ -209,10 +211,10 @@ def plot_training_curves(history: Dict[str, List[float]], out_path: str):
 
     # Metric subplot (Macro-F1)
     plt.subplot(1, 2, 2)
-    if "train_macro_f1" in history:
-        plt.plot(epochs, history["train_macro_f1"], label="train_macro_f1", marker='o')
-    if "val_macro_f1" in history:
-        plt.plot(epochs, history["val_macro_f1"], label="val_macro_f1", marker='o')
+    if "train_macro_f1" in history and len(history["train_macro_f1"]) > 0:
+        plt.plot(list(_epochs_for("train_macro_f1")), history["train_macro_f1"], label="train_macro_f1", marker="o")
+    if "val_macro_f1" in history and len(history["val_macro_f1"]) > 0:
+        plt.plot(list(_epochs_for("val_macro_f1")), history["val_macro_f1"], label="val_macro_f1", marker="o")
     plt.xlabel("Epoch")
     plt.ylabel("Macro F1")
     plt.legend()
@@ -221,7 +223,6 @@ def plot_training_curves(history: Dict[str, List[float]], out_path: str):
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close()
-
 
 # -------------------------
 # Small helpers

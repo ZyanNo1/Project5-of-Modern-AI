@@ -144,10 +144,10 @@ def main(args):
                                  embed_dim=None,
                                  hidden_dims=(args.hidden_dim, args.hidden_dim2),
                                  dropout=args.dropout,
-                                 freeze_clip=args.freeze_clip,
+                                 freeze_clip=(True if args.two_stage else args.freeze_clip),
                                  num_classes=len(LABEL2ID))
     model.to(device)
-    logger.info("Model initialized. Freeze CLIP: %s", args.freeze_clip)
+    logger.info("Model initialized. Freeze CLIP: %s", True if args.two_stage else args.freeze_clip)
 
     # loss, optimizer, scheduler
     if args.class_weights:
@@ -275,6 +275,12 @@ def main(args):
         _run_epochs(start_epoch=1, max_epoch=args.epochs, stage_name="train")
 
     # finalize: save history and plot curves
+    if args.two_stage:
+        history["train_loss"] = history.get("stage1_train_loss", []) + history.get("stage2_train_loss", [])
+        history["val_loss"] = history.get("stage1_val_loss", []) + history.get("stage2_val_loss", [])
+        history["train_macro_f1"] = history.get("stage1_train_macro_f1", []) + history.get("stage2_train_macro_f1", [])
+        history["val_macro_f1"] = history.get("stage1_val_macro_f1", []) + history.get("stage2_val_macro_f1", [])
+    
     plot_path = os.path.join(out_dir, "training_curves.png")
     plot_training_curves(history, plot_path)
     logger.info("Saved training curves to %s", plot_path)
