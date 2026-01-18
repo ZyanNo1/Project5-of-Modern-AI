@@ -84,16 +84,62 @@ class LateFusionClassifier(nn.Module):
         for p in self.clip.parameters():
             p.requires_grad = True
 
-    def unfreeze_text_encoder(self):
-        """Unfreeze only text encoder parameters."""
+    def unfreeze_text_encoder(self, n_last_layers: int = 0) -> None:
+        """
+        Unfreeze text encoder parameters.
+        If n_last_layers > 0, only unfreeze last N transformer layers (and final layer norm).
+        If n_last_layers <= 0, unfreeze the whole text encoder.
+        """
+        if n_last_layers <= 0:
+            for name, p in self.clip.named_parameters():
+                if name.startswith("text_model"):
+                    p.requires_grad = True
+            return
+
+        # freeze all text encoder params first
         for name, p in self.clip.named_parameters():
             if name.startswith("text_model"):
+                p.requires_grad = False
+
+        # unfreeze last N layers
+        layers = self.clip.text_model.encoder.layers
+        n = min(n_last_layers, len(layers))
+        for layer in layers[-n:]:
+            for p in layer.parameters():
                 p.requires_grad = True
 
-    def unfreeze_vision_encoder(self):
-        """Unfreeze only vision encoder parameters."""
+        # also unfreeze final layer norm (helps adaptation)
+        if hasattr(self.clip.text_model, "final_layer_norm"):
+            for p in self.clip.text_model.final_layer_norm.parameters():
+                p.requires_grad = True
+
+    def unfreeze_vision_encoder(self, n_last_layers: int = 0) -> None:
+        """
+        Unfreeze vision encoder parameters.
+        If n_last_layers > 0, only unfreeze last N transformer layers (and post layer norm).
+        If n_last_layers <= 0, unfreeze the whole vision encoder.
+        """
+        if n_last_layers <= 0:
+            for name, p in self.clip.named_parameters():
+                if name.startswith("vision_model"):
+                    p.requires_grad = True
+            return
+
+        # freeze all vision encoder params first
         for name, p in self.clip.named_parameters():
             if name.startswith("vision_model"):
+                p.requires_grad = False
+
+        # unfreeze last N layers
+        layers = self.clip.vision_model.encoder.layers
+        n = min(n_last_layers, len(layers))
+        for layer in layers[-n:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+
+        # also unfreeze post layer norm (helps adaptation)
+        if hasattr(self.clip.vision_model, "post_layernorm"):
+            for p in self.clip.vision_model.post_layernorm.parameters():
                 p.requires_grad = True
 
     def get_image_embedding(self, pixel_values: torch.Tensor) -> torch.Tensor:

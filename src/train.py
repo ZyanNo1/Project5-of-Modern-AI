@@ -73,6 +73,19 @@ def validate(model, dataloader, criterion, device):
     metrics = compute_metrics(all_labels, all_preds, labels=list(range(len(LABEL2ID))))
     return avg_loss, metrics
 
+def _build_optimizer(model: LateFusionClassifier, lr_head: float, lr_clip: float, weight_decay: float):
+    """Build AdamW with param groups: clip vs head (robust grouping by object id)."""
+    clip_param_ids = {id(p) for p in model.clip.parameters()}
+    clip_params = [p for p in model.clip.parameters() if p.requires_grad]
+    head_params = [p for p in model.parameters() if p.requires_grad and id(p) not in clip_param_ids]
+
+    param_groups = []
+    if clip_params:
+        param_groups.append({"params": clip_params, "lr": lr_clip})
+    if head_params:
+        param_groups.append({"params": head_params, "lr": lr_head})
+
+    return AdamW(param_groups, weight_decay=weight_decay)
 
 # -------------------------
 # Main training loop
@@ -87,9 +100,6 @@ def main(args):
 
     with open(os.path.join(out_dir, "hparams.json"), "w", encoding="utf-8") as f:
         json.dump(vars(args), f, ensure_ascii=False, indent=2, sort_keys=True)
-
-    logger = setup_logger(log_file=os.path.join(out_dir, "train.log"))
-    logger.info("Output dir: %s", out_dir)
     logger.info("Hyperparameters saved to %s", os.path.join(out_dir, "hparams.json"))
 
     # reproducibility & device
@@ -139,77 +149,130 @@ def main(args):
     model.to(device)
     logger.info("Model initialized. Freeze CLIP: %s", args.freeze_clip)
 
-
     # loss, optimizer, scheduler
     if args.class_weights:
         counts = train_df["tag"].map(LABEL2ID).value_counts().sort_index().values.astype(float)
-
         inv = counts.sum() / (counts + 1e-12)  # inverse frequency
         inv = inv / inv.mean()                 # normalize: mean weight = 1
         inv = inv ** 0.5                       # soften extremes (sqrt)
-
         weights = torch.tensor(inv, dtype=torch.float32, device=device)
         criterion = nn.CrossEntropyLoss(weight=weights)
         logger.info("Using class weights for loss (smoothed): %s", weights.tolist())
     else:
         criterion = nn.CrossEntropyLoss()
 
-
-    # optimizer: only train parameters that require grad
-    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_head, weight_decay=args.weight_decay)
-
-    # scheduler: simple ReduceLROnPlateau or CosineAnnealingWarmRestarts can be used; use ReduceLROnPlateau here
+    
+    # ---- stage1 optimizer/scheduler ----
+    optimizer = _build_optimizer(model, lr_head=args.lr_head, lr_clip=args.lr_clip, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=1)
 
-    # training loop variables
     best_val_macro = -1.0
     best_epoch = -1
     history = defaultdict(list)
     patience_counter = 0
 
-    # training epochs
-    for epoch in range(1, args.epochs + 1):
-        logger.info("Epoch %d/%d", epoch, args.epochs)
+    def _run_epochs(start_epoch: int, max_epoch: int, stage_name: str):
+        nonlocal best_val_macro, best_epoch, patience_counter, optimizer, scheduler
 
-        train_loss, train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_metrics = validate(model, val_loader, criterion, device)
+        for epoch in range(start_epoch, max_epoch + 1):
+            logger.info("[%s] Epoch %d/%d", stage_name, epoch, max_epoch)
 
-        # logging
-        logger.info("Train loss: %.4f | Train macro_f1: %.4f | Val loss: %.4f | Val macro_f1: %.4f",
-                    train_loss, train_metrics["macro_f1"], val_loss, val_metrics["macro_f1"])
+            train_loss, train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            val_loss, val_metrics = validate(model, val_loader, criterion, device)
 
-        # record history
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["train_macro_f1"].append(train_metrics["macro_f1"])
-        history["val_macro_f1"].append(val_metrics["macro_f1"])
+            logger.info("[%s] Train loss: %.4f | Train macro_f1: %.4f | Val loss: %.4f | Val macro_f1: %.4f",
+                        stage_name, train_loss, train_metrics["macro_f1"], val_loss, val_metrics["macro_f1"])
 
-        # scheduler step (ReduceLROnPlateau uses metric)
-        scheduler.step(val_metrics["macro_f1"])
+            history[f"{stage_name}_train_loss"].append(train_loss)
+            history[f"{stage_name}_val_loss"].append(val_loss)
+            history[f"{stage_name}_train_macro_f1"].append(train_metrics["macro_f1"])
+            history[f"{stage_name}_val_macro_f1"].append(val_metrics["macro_f1"])
 
-        # save checkpoint if improved
-        if val_metrics["macro_f1"] > best_val_macro:
-            best_val_macro = val_metrics["macro_f1"]
-            best_epoch = epoch
-            patience_counter = 0
-            ckpt_path = os.path.join(out_dir, "best_checkpoint.pth")
-            save_checkpoint({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "val_macro_f1": val_metrics["macro_f1"],
-                "args": vars(args)
-            }, checkpoint_dir=out_dir, filename="best_checkpoint.pth")
-            logger.info("Saved new best checkpoint (epoch %d, val_macro_f1 %.4f)", epoch, val_metrics["macro_f1"])
-        else:
-            patience_counter += 1
-            logger.info("No improvement. Patience %d/%d", patience_counter, args.early_stop_patience)
+            scheduler.step(val_metrics["macro_f1"])
 
-        # early stopping
-        if patience_counter >= args.early_stop_patience:
-            logger.info("Early stopping triggered. Best epoch: %d (val_macro_f1=%.4f)", best_epoch, best_val_macro)
-            break
+            if val_metrics["macro_f1"] > best_val_macro:
+                best_val_macro = val_metrics["macro_f1"]
+                best_epoch = epoch
+                patience_counter = 0
+
+                save_checkpoint({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "val_macro_f1": val_metrics["macro_f1"],
+                    "args": vars(args)
+                }, checkpoint_dir=out_dir, filename="best_checkpoint.pth")
+                logger.info("[%s] Saved new best checkpoint (epoch %d, val_macro_f1 %.4f)",
+                            stage_name, epoch, val_metrics["macro_f1"])
+            else:
+                patience_counter += 1
+                logger.info("[%s] No improvement. Patience %d/%d", stage_name, patience_counter, args.early_stop_patience)
+
+            if patience_counter >= args.early_stop_patience:
+                logger.info("[%s] Early stopping triggered. Best epoch so far: %d (val_macro_f1=%.4f)",
+                            stage_name, best_epoch, best_val_macro)
+                break
+
+    # ----------------
+    # Stage 1 (freeze)
+    # ----------------
+    if args.two_stage:
+        logger.info("Two-stage training enabled.")
+        logger.info("Stage1: freeze CLIP, train head only for %d epoch(s).", args.stage1_epochs)
+        _run_epochs(start_epoch=1, max_epoch=args.stage1_epochs, stage_name="stage1")
+
+        # Save stage1 best separately (optional convenience)
+        # (best_checkpoint already saved; we copy it for clarity)
+        stage1_best = os.path.join(out_dir, "stage1_best_checkpoint.pth")
+        try:
+            import shutil
+            shutil.copyfile(os.path.join(out_dir, "best_checkpoint.pth"), stage1_best)
+            logger.info("Copied stage1 best checkpoint to %s", stage1_best)
+        except Exception as e:
+            logger.warning("Could not copy stage1 best checkpoint: %s", str(e))
+
+        # ----------------
+        # Stage 2 (unfreeze)
+        # ----------------
+        # Reset early-stopping counter for stage2 to avoid stopping immediately
+        patience_counter = 0
+
+        # Load best weights before finetuning further
+        ckpt = torch.load(os.path.join(out_dir, "best_checkpoint.pth"), map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        logger.info("Loaded best checkpoint before Stage2 finetune.")
+
+        # Ensure CLIP is frozen then selectively unfreeze
+        model.freeze_clip()
+        if args.unfreeze_text:
+            model.unfreeze_text_encoder(n_last_layers=args.unfreeze_text_layers)
+            logger.info("Stage2: Unfroze CLIP text encoder last %d layer(s).", args.unfreeze_text_layers)
+        if args.unfreeze_vision:
+            model.unfreeze_vision_encoder(n_last_layers=args.unfreeze_vision_layers)
+            logger.info("Stage2: Unfroze CLIP vision encoder last %d layer(s).", args.unfreeze_vision_layers)
+
+        # Rebuild optimizer/scheduler for new trainable set
+        optimizer = _build_optimizer(model, lr_head=args.lr_head, lr_clip=args.lr_clip, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=1)
+
+        logger.info("Stage2: finetune for %d epoch(s). (total epochs=%d)",
+                    args.stage2_epochs, args.stage1_epochs + args.stage2_epochs)
+        _run_epochs(
+            start_epoch=args.stage1_epochs + 1,
+            max_epoch=args.stage1_epochs + args.stage2_epochs,
+            stage_name="stage2"
+        )
+    else:
+        # original single-stage behavior
+        if args.unfreeze_text:
+            model.unfreeze_text_encoder(n_last_layers=args.unfreeze_text_layers)
+            logger.info("Unfroze CLIP text encoder last %d layer(s).", args.unfreeze_text_layers)
+        if args.unfreeze_vision:
+            model.unfreeze_vision_encoder(n_last_layers=args.unfreeze_vision_layers)
+            logger.info("Unfroze CLIP vision encoder last %d layer(s).", args.unfreeze_vision_layers)
+
+        _run_epochs(start_epoch=1, max_epoch=args.epochs, stage_name="train")
 
     # finalize: save history and plot curves
     plot_path = os.path.join(out_dir, "training_curves.png")
@@ -242,6 +305,13 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--epochs", type=int, default=20, help="Max epochs")
     parser.add_argument("--lr_head", type=float, default=1e-3, help="Learning rate for classification head")
+    parser.add_argument("--lr_clip", type=float, default=1e-5, help="Learning rate for CLIP backbone (when unfrozen)")
+    parser.add_argument("--unfreeze_text", action="store_true", help="Unfreeze CLIP text encoder for light finetune")
+    parser.add_argument("--unfreeze_vision", action="store_true", help="Unfreeze CLIP vision encoder for light finetune")
+    parser.add_argument("--unfreeze_text_layers", type=int, default=1,
+                        help="How many last text transformer layers to unfreeze (ignored if --unfreeze_text not set)")
+    parser.add_argument("--unfreeze_vision_layers", type=int, default=1,
+                        help="How many last vision transformer layers to unfreeze (ignored if --unfreeze_vision not set)")
     parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay")
     parser.add_argument("--hidden_dim", type=int, default=512, help="Hidden dim for head first layer")
     parser.add_argument("--hidden_dim2", type=int, default=128, help="Hidden dim for head second layer")
@@ -253,6 +323,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader num_workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--early_stop_patience", type=int, default=3, help="Early stopping patience (epochs)")
+    parser.add_argument("--two_stage", action="store_true", help="Enable two-stage training: stage1 freeze CLIP, stage2 light finetune.")
+    parser.add_argument("--stage1_epochs", type=int, default=5, help="Epochs for stage1 (freeze CLIP, train head).")
+    parser.add_argument("--stage2_epochs", type=int, default=5, help="Epochs for stage2 (light finetune from best stage1).")
     args = parser.parse_args()
 
     main(args)
