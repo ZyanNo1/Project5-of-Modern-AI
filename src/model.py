@@ -24,6 +24,8 @@ class LateFusionClassifier(nn.Module):
       fusion: fusion type for image/text embeddings: "concat" or "gated".
              - concat: x = [img; txt], head input dim = 2*D
              - gated:  x = gate * txt + (1-gate) * img, head input dim = D
+             - film:  x = (1 + gamma) * txt + beta + img   (vector FiLM, with residual img)
+             - film_concat: x = [ (1+gamma_v)*img + beta_v ; (1+gamma_t)*txt + beta_t ]
     """
 
     def __init__(self,
@@ -77,6 +79,18 @@ class LateFusionClassifier(nn.Module):
                 nn.Sigmoid()
             )
             head_input_dim = self.embed_dim
+        elif self.fusion in ("film", "film_concat"):
+            # Produce gamma/beta vectors from concatenated embeddings
+            # Keep it small to avoid overfitting.
+            out_dim = (2 * self.embed_dim) if self.fusion == "film" else (4 * self.embed_dim)
+            self.film_mlp = nn.Sequential(
+                nn.Linear(self.embed_dim * 2, 256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=dropout),
+                nn.Linear(256, out_dim)
+            )
+            self.gate_mlp = None
+            head_input_dim = self.embed_dim if self.fusion == "film" else (2 * self.embed_dim)
         elif self.fusion == "concat":
             self.gate_mlp = None
             head_input_dim = self.embed_dim * 2
@@ -94,9 +108,6 @@ class LateFusionClassifier(nn.Module):
         layers.append(nn.Linear(in_dim, num_classes))
         self.classifier = nn.Sequential(*layers)
 
-        # Optional layernorm on embeddings (stabilizes training)
-        self.image_norm = nn.LayerNorm(self.embed_dim)
-        self.text_norm = nn.LayerNorm(self.embed_dim)
 
     def freeze_clip(self):
         """Freeze all parameters of the CLIP backbone."""
@@ -226,11 +237,32 @@ class LateFusionClassifier(nn.Module):
         # Concatenate and classify
         if self.fusion == "concat":
             x = torch.cat([image_emb, text_emb], dim=1)  # (B, 2*D)
+
+        elif self.fusion == "gated":
+            gate = self.gate_mlp(torch.cat([image_emb, text_emb], dim=1))  # (B,1)
+            x = gate * text_emb + (1.0 - gate) * image_emb
+
+        elif self.fusion == "film":
+            # film params from both modalities
+            params = self.film_mlp(torch.cat([image_emb, text_emb], dim=1))  # (B, 2D)
+            gamma, beta = params.chunk(2, dim=1)  # each (B, D)
+
+            # FiLM on text, residual image keeps a stable baseline
+            x = (1.0 + torch.tanh(gamma)) * text_emb + beta + image_emb  # (B, D)
+
+        elif self.fusion == "film_concat":
+            # produce separate (gamma,beta) for vision and text
+            params = self.film_mlp(torch.cat([image_emb, text_emb], dim=1))  # (B, 4D)
+            gamma_v, beta_v, gamma_t, beta_t = params.chunk(4, dim=1)  # each (B, D)
+
+            beta_scale = 0.1
+            v = (1.0 + torch.tanh(gamma_v)) * image_emb + beta_scale * beta_v
+            t = (1.0 + torch.tanh(gamma_t)) * text_emb + beta_scale * beta_t
+            x = torch.cat([v, t], dim=1)  # (B, 2D)
+
         else:
-            # gated: scalar gate per sample
-            gate = self.gate_mlp(torch.cat([image_emb, text_emb], dim=1))  # (B, 1)
-            x = gate * text_emb + (1.0 - gate) * image_emb  # (B, D)
-            
+            raise ValueError(f"Unknown fusion type: {self.fusion}")
+
         logits = self.classifier(x)  # (B, num_classes)
 
         if return_embeddings:

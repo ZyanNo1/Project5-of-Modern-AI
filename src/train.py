@@ -334,7 +334,7 @@ if __name__ == "__main__":
     parser.add_argument("--two_stage", action="store_true", help="Enable two-stage training: stage1 freeze CLIP, stage2 light finetune.")
     parser.add_argument("--stage1_epochs", type=int, default=5, help="Epochs for stage1 (freeze CLIP, train head).")
     parser.add_argument("--stage2_epochs", type=int, default=5, help="Epochs for stage2 (light finetune from best stage1).")
-    parser.add_argument("--fusion", type=str, default="concat", choices=["concat", "gated"], 
+    parser.add_argument("--fusion", type=str, default="concat", choices=["concat", "gated", "film", "film_concat"], 
                         help="Fusion type for image/text embeddings (default: concat).")
     args = parser.parse_args()
 
