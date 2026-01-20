@@ -52,6 +52,7 @@ def main(args):
     hidden_dim2 = int(run_hparams.get("hidden_dim2", 128))
     dropout = float(run_hparams.get("dropout", 0.3))
     freeze_clip = bool(run_hparams.get("freeze_clip", False))
+    fusion = run_hparams.get("fusion", "concat")
 
     # Tokenizer
     tok_wrapper = TokenizerWrapper(
@@ -87,7 +88,8 @@ def main(args):
         hidden_dims=(hidden_dim, hidden_dim2),
         dropout=dropout,
         freeze_clip=freeze_clip,
-        num_classes=3
+        num_classes=3,
+        fusion=fusion
     )
     model.to(device)
 

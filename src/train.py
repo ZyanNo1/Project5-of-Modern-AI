@@ -145,9 +145,11 @@ def main(args):
                                  hidden_dims=(args.hidden_dim, args.hidden_dim2),
                                  dropout=args.dropout,
                                  freeze_clip=(True if args.two_stage else args.freeze_clip),
-                                 num_classes=len(LABEL2ID))
+                                 num_classes=len(LABEL2ID),
+                                 fusion=args.fusion)
     model.to(device)
     logger.info("Model initialized. Freeze CLIP: %s", True if args.two_stage else args.freeze_clip)
+    logger.info("Fusion type: %s", args.fusion)
 
     # loss, optimizer, scheduler
     if args.class_weights:
@@ -332,6 +334,8 @@ if __name__ == "__main__":
     parser.add_argument("--two_stage", action="store_true", help="Enable two-stage training: stage1 freeze CLIP, stage2 light finetune.")
     parser.add_argument("--stage1_epochs", type=int, default=5, help="Epochs for stage1 (freeze CLIP, train head).")
     parser.add_argument("--stage2_epochs", type=int, default=5, help="Epochs for stage2 (light finetune from best stage1).")
+    parser.add_argument("--fusion", type=str, default="concat", choices=["concat", "gated"], 
+                        help="Fusion type for image/text embeddings (default: concat).")
     args = parser.parse_args()
 
     main(args)

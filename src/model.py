@@ -21,6 +21,9 @@ class LateFusionClassifier(nn.Module):
       hidden_dims: list of hidden dims for MLP head (e.g., [512, 128]).
       dropout: dropout probability in head.
       freeze_clip: if True, freeze CLIP backbone parameters initially.
+      fusion: fusion type for image/text embeddings: "concat" or "gated".
+             - concat: x = [img; txt], head input dim = 2*D
+             - gated:  x = gate * txt + (1-gate) * img, head input dim = D
     """
 
     def __init__(self,
@@ -29,8 +32,11 @@ class LateFusionClassifier(nn.Module):
                  hidden_dims: Tuple[int, ...] = (512, 128),
                  dropout: float = 0.3,
                  freeze_clip: bool = True,
-                 num_classes: int = 3):
+                 num_classes: int = 3,
+                 fusion: str = "concat"):
         super().__init__()
+
+        self.fusion = fusion.lower().strip()
 
         # Load CLIP model (image + text encoders)
         self.clip = CLIPModel.from_pretrained(clip_model_name)
@@ -58,8 +64,26 @@ class LateFusionClassifier(nn.Module):
         if freeze_clip:
             self.freeze_clip()
 
-        # Build classification head: input dim = image_emb + text_emb
-        head_input_dim = self.embed_dim * 2
+        # Gated fusion
+        self.image_norm = nn.LayerNorm(self.embed_dim)
+        self.text_norm = nn.LayerNorm(self.embed_dim)
+
+        if self.fusion == "gated":
+            self.gate_mlp = nn.Sequential(
+                nn.Linear(self.embed_dim * 2, 128),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=dropout),
+                nn.Linear(128, 1),
+                nn.Sigmoid()
+            )
+            head_input_dim = self.embed_dim
+        elif self.fusion == "concat":
+            self.gate_mlp = None
+            head_input_dim = self.embed_dim * 2
+        else:
+            raise ValueError(f"Unknown fusion type: {fusion}. Use 'concat' or 'gated'.")
+
+        # Build classification head
         layers = []
         in_dim = head_input_dim
         for h in hidden_dims:
@@ -200,7 +224,13 @@ class LateFusionClassifier(nn.Module):
             text_emb = torch.zeros((image_emb.size(0), self.embed_dim), device=image_emb.device, dtype=image_emb.dtype)
 
         # Concatenate and classify
-        x = torch.cat([image_emb, text_emb], dim=1)  # (B, 2*embed_dim)
+        if self.fusion == "concat":
+            x = torch.cat([image_emb, text_emb], dim=1)  # (B, 2*D)
+        else:
+            # gated: scalar gate per sample
+            gate = self.gate_mlp(torch.cat([image_emb, text_emb], dim=1))  # (B, 1)
+            x = gate * text_emb + (1.0 - gate) * image_emb  # (B, D)
+            
         logits = self.classifier(x)  # (B, num_classes)
 
         if return_embeddings:
