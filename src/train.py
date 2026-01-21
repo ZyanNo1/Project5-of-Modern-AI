@@ -10,6 +10,8 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
+import pandas as pd
+
 from transformers import CLIPTokenizerFast
 
 from datasets import get_dataloaders, LABEL2ID, ID2LABEL
@@ -73,15 +75,46 @@ def validate(model, dataloader, criterion, device):
     metrics = compute_metrics(all_labels, all_preds, labels=list(range(len(LABEL2ID))))
     return avg_loss, metrics
 
-def _build_optimizer(model: LateFusionClassifier, lr_head: float, lr_clip: float, weight_decay: float):
-    """Build AdamW with param groups: clip vs head (robust grouping by object id)."""
+def _build_optimizer(model: LateFusionClassifier, lr_head: float, lr_clip: float, weight_decay: float, lr_attn: float = None):
+    """Build AdamW with param groups: clip vs (cross-attn) vs head, with no duplicates."""
     clip_param_ids = {id(p) for p in model.clip.parameters()}
-    clip_params = [p for p in model.clip.parameters() if p.requires_grad]
-    head_params = [p for p in model.parameters() if p.requires_grad and id(p) not in clip_param_ids]
+
+    # collect attn param ids (if model has cross-attn modules)
+    attn_param_ids = set()
+    attn_params = []
+    for attr in ("q_proj", "kv_proj", "cross_attn", "out_proj"):
+        if hasattr(model, attr):
+            m = getattr(model, attr)
+            if m is None:
+                continue
+            for p in m.parameters():
+                attn_param_ids.add(id(p))
+
+    # now split parameters (mutually exclusive)
+    clip_params = []
+    head_params = []
+    attn_trainable_params = []
+
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        pid = id(p)
+        if pid in clip_param_ids:
+            clip_params.append(p)
+        elif pid in attn_param_ids:
+            attn_trainable_params.append(p)
+        else:
+            head_params.append(p)
 
     param_groups = []
     if clip_params:
         param_groups.append({"params": clip_params, "lr": lr_clip})
+    if attn_trainable_params:
+        param_groups.append({
+            "params": attn_trainable_params,
+            "lr": (lr_head if lr_attn is None else lr_attn),
+            "weight_decay": weight_decay
+        })
     if head_params:
         param_groups.append({"params": head_params, "lr": lr_head})
 
@@ -165,7 +198,7 @@ def main(args):
 
     
     # ---- stage1 optimizer/scheduler ----
-    optimizer = _build_optimizer(model, lr_head=args.lr_head, lr_clip=args.lr_clip, weight_decay=args.weight_decay)
+    optimizer = _build_optimizer(model, lr_head=args.lr_head, lr_clip=args.lr_clip, weight_decay=args.weight_decay, lr_attn=args.lr_attn)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=1)
 
     best_val_macro = -1.0
@@ -255,7 +288,7 @@ def main(args):
             logger.info("Stage2: Unfroze CLIP vision encoder last %d layer(s).", args.unfreeze_vision_layers)
 
         # Rebuild optimizer/scheduler for new trainable set
-        optimizer = _build_optimizer(model, lr_head=args.lr_head, lr_clip=args.lr_clip, weight_decay=args.weight_decay)
+        optimizer = _build_optimizer(model, lr_head=args.lr_head, lr_clip=args.lr_clip, weight_decay=args.weight_decay, lr_attn=args.lr_attn)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=1)
 
         logger.info("Stage2: finetune for %d epoch(s). (total epochs=%d)",
@@ -314,6 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=20, help="Max epochs")
     parser.add_argument("--lr_head", type=float, default=1e-3, help="Learning rate for classification head")
     parser.add_argument("--lr_clip", type=float, default=1e-5, help="Learning rate for CLIP backbone (when unfrozen)")
+    parser.add_argument("--lr_attn", type=float, default=1e-4, help="Learning rate for cross-attention modules (q/kv proj, MHA, out proj).")
     parser.add_argument("--unfreeze_text", action="store_true", help="Unfreeze CLIP text encoder for light finetune")
     parser.add_argument("--unfreeze_vision", action="store_true", help="Unfreeze CLIP vision encoder for light finetune")
     parser.add_argument("--unfreeze_text_layers", type=int, default=1,
@@ -334,7 +368,7 @@ if __name__ == "__main__":
     parser.add_argument("--two_stage", action="store_true", help="Enable two-stage training: stage1 freeze CLIP, stage2 light finetune.")
     parser.add_argument("--stage1_epochs", type=int, default=5, help="Epochs for stage1 (freeze CLIP, train head).")
     parser.add_argument("--stage2_epochs", type=int, default=5, help="Epochs for stage2 (light finetune from best stage1).")
-    parser.add_argument("--fusion", type=str, default="concat", choices=["concat", "gated", "film", "film_concat"], 
+    parser.add_argument("--fusion", type=str, default="concat", choices=["concat", "gated", "film", "film_concat", "cross_attn"],
                         help="Fusion type for image/text embeddings (default: concat).")
     args = parser.parse_args()
 

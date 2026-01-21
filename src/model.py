@@ -35,7 +35,8 @@ class LateFusionClassifier(nn.Module):
                  dropout: float = 0.3,
                  freeze_clip: bool = True,
                  num_classes: int = 3,
-                 fusion: str = "concat"):
+                 fusion: str = "concat",
+                 cross_attn_heads: int = 8):
         super().__init__()
 
         self.fusion = fusion.lower().strip()
@@ -43,22 +44,13 @@ class LateFusionClassifier(nn.Module):
         # Load CLIP model (image + text encoders)
         self.clip = CLIPModel.from_pretrained(clip_model_name)
 
-        # Determine embedding dim
-        if embed_dim is None:
-            # CLIPModel config has projection dims
-            cfg: CLIPConfig = self.clip.config
-            # text_config and vision_config may differ; CLIPModel projects to text_config.projection_dim
-            # Use text_projection if available, else vision_projection
-            embed_dim = getattr(cfg, "text_config", None) and getattr(cfg.text_config, "projection_dim", None)
-            if embed_dim is None:
-                # fallback to vision projection dim
-                embed_dim = getattr(cfg, "vision_config", None) and getattr(cfg.vision_config, "projection_dim", None)
-            if embed_dim is None:
-                # last resort: use hidden_size of text model
-                embed_dim = getattr(cfg, "text_config", None) and getattr(cfg.text_config, "hidden_size", 512)
-            if embed_dim is None:
-                embed_dim = 512
+        cfg: CLIPConfig = self.clip.config
+        self.text_hidden = cfg.text_config.hidden_size
+        self.vision_hidden = cfg.vision_config.hidden_size
 
+        # projection dim used by get_*_features
+        if embed_dim is None:
+            embed_dim = getattr(cfg.text_config, "projection_dim", 512)
         self.embed_dim = embed_dim
         self.num_classes = num_classes
 
@@ -94,6 +86,24 @@ class LateFusionClassifier(nn.Module):
         elif self.fusion == "concat":
             self.gate_mlp = None
             head_input_dim = self.embed_dim * 2
+        elif self.fusion == "cross_attn":
+            self.gate_mlp = None
+            self.film_mlp = None
+
+            attn_dim = self.embed_dim  # keep it small/stable
+            self.q_proj = nn.Linear(self.text_hidden, attn_dim)
+            self.kv_proj = nn.Linear(self.vision_hidden, attn_dim)
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=attn_dim, num_heads=cross_attn_heads, dropout=dropout, batch_first=True
+            )
+            self.out_proj = nn.Sequential(
+                nn.LayerNorm(attn_dim),
+                nn.Dropout(p=dropout),
+                nn.Linear(attn_dim, self.embed_dim)
+            )
+            self.attn_gate = nn.Parameter(torch.tensor(-4.0))  # sigmoid(-4)≈0.018, starts almost off
+            # head will see [cross_attended_text ; pooled_text ; pooled_image]
+            head_input_dim = self.embed_dim * 3
         else:
             raise ValueError(f"Unknown fusion type: {fusion}. Use 'concat' or 'gated'.")
 
@@ -217,56 +227,84 @@ class LateFusionClassifier(nn.Module):
         if image is None and (input_ids is None or attention_mask is None):
             raise ValueError("At least one of image or text inputs must be provided.")
 
-        # Compute embeddings
-        # If backbone frozen, compute under torch.no_grad to save memory
-        if not any(p.requires_grad for p in self.clip.parameters()):
-            # backbone frozen
-            with torch.no_grad():
+        backbone_frozen = not any(p.requires_grad for p in self.clip.parameters())
+
+        if self.fusion != "cross_attn":
+            # ---- existing pooled-embedding paths ----
+            if backbone_frozen:
+                with torch.no_grad():
+                    image_emb = self.get_image_embedding(image) if image is not None else None
+                    text_emb = self.get_text_embedding(input_ids, attention_mask) if input_ids is not None else None
+            else:
                 image_emb = self.get_image_embedding(image) if image is not None else None
                 text_emb = self.get_text_embedding(input_ids, attention_mask) if input_ids is not None else None
+
+            if image_emb is None:
+                image_emb = torch.zeros((text_emb.size(0), self.embed_dim), device=text_emb.device, dtype=text_emb.dtype)
+            if text_emb is None:
+                text_emb = torch.zeros((image_emb.size(0), self.embed_dim), device=image_emb.device, dtype=image_emb.dtype)
+
+            if self.fusion == "concat":
+                x = torch.cat([image_emb, text_emb], dim=1)
+            elif self.fusion == "gated":
+                gate = self.gate_mlp(torch.cat([image_emb, text_emb], dim=1))
+                x = gate * text_emb + (1.0 - gate) * image_emb
+            elif self.fusion == "film":
+                params = self.film_mlp(torch.cat([image_emb, text_emb], dim=1))
+                gamma, beta = params.chunk(2, dim=1)
+                x = (1.0 + torch.tanh(gamma)) * text_emb + beta + image_emb
+            elif self.fusion == "film_concat":
+                params = self.film_mlp(torch.cat([image_emb, text_emb], dim=1))
+                gamma_v, beta_v, gamma_t, beta_t = params.chunk(4, dim=1)
+                beta_scale = 0.1
+                v = (1.0 + torch.tanh(gamma_v)) * image_emb + beta_scale * beta_v
+                t = (1.0 + torch.tanh(gamma_t)) * text_emb + beta_scale * beta_t
+                x = torch.cat([v, t], dim=1)
+            else:
+                raise ValueError(f"Unknown fusion type: {self.fusion}")
+
+            logits = self.classifier(x)
+            if return_embeddings:
+                return logits, image_emb, text_emb
+            return logits
+
+        # ---- cross_attn path  ----
+        if image is None or input_ids is None or attention_mask is None:
+            raise ValueError("fusion=cross_attn requires both image and text inputs.")
+
+        # get pooled embeddings (still useful as global features)
+        if backbone_frozen:
+            with torch.no_grad():
+                pooled_img = self.get_image_embedding(image)
+                pooled_txt = self.get_text_embedding(input_ids, attention_mask)
+
+                v_hid = self.clip.vision_model(pixel_values=image).last_hidden_state  # (B, Nv, Hv)
+                t_hid = self.clip.text_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state  # (B, Lt, Ht)
         else:
-            image_emb = self.get_image_embedding(image) if image is not None else None
-            text_emb = self.get_text_embedding(input_ids, attention_mask) if input_ids is not None else None
+            pooled_img = self.get_image_embedding(image)
+            pooled_txt = self.get_text_embedding(input_ids, attention_mask)
+            v_hid = self.clip.vision_model(pixel_values=image).last_hidden_state
+            t_hid = self.clip.text_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
-        # If one modality missing, use zeros for the other (so classifier shape consistent)
-        if image_emb is None:
-            image_emb = torch.zeros((text_emb.size(0), self.embed_dim), device=text_emb.device, dtype=text_emb.dtype)
-        if text_emb is None:
-            text_emb = torch.zeros((image_emb.size(0), self.embed_dim), device=image_emb.device, dtype=image_emb.dtype)
+        # projections to attn_dim
+        q = self.q_proj(t_hid)         # (B, Lt, D)
+        kv = self.kv_proj(v_hid)       # (B, Nv, D)
 
-        # Concatenate and classify
-        if self.fusion == "concat":
-            x = torch.cat([image_emb, text_emb], dim=1)  # (B, 2*D)
+        # key padding: vision has no padding; for text we can mask queries implicitly by using attention_mask and pooling later
+        attn_out, _ = self.cross_attn(query=q, key=kv, value=kv, need_weights=False)  # (B, Lt, D)
 
-        elif self.fusion == "gated":
-            gate = self.gate_mlp(torch.cat([image_emb, text_emb], dim=1))  # (B,1)
-            x = gate * text_emb + (1.0 - gate) * image_emb
+        # masked mean pool over text length
+        m = attention_mask.unsqueeze(-1).to(attn_out.dtype)  # (B, Lt, 1)
+        attn_pooled = (attn_out * m).sum(dim=1) / (m.sum(dim=1).clamp_min(1.0))  # (B, D)
+        attn_feat = self.out_proj(attn_pooled)  # (B, embed_dim)
+        
+        gate = torch.sigmoid(self.attn_gate)  # scalar in (0,1)
+        attn_feat = gate * attn_feat
 
-        elif self.fusion == "film":
-            # film params from both modalities
-            params = self.film_mlp(torch.cat([image_emb, text_emb], dim=1))  # (B, 2D)
-            gamma, beta = params.chunk(2, dim=1)  # each (B, D)
-
-            # FiLM on text, residual image keeps a stable baseline
-            x = (1.0 + torch.tanh(gamma)) * text_emb + beta + image_emb  # (B, D)
-
-        elif self.fusion == "film_concat":
-            # produce separate (gamma,beta) for vision and text
-            params = self.film_mlp(torch.cat([image_emb, text_emb], dim=1))  # (B, 4D)
-            gamma_v, beta_v, gamma_t, beta_t = params.chunk(4, dim=1)  # each (B, D)
-
-            beta_scale = 0.1
-            v = (1.0 + torch.tanh(gamma_v)) * image_emb + beta_scale * beta_v
-            t = (1.0 + torch.tanh(gamma_t)) * text_emb + beta_scale * beta_t
-            x = torch.cat([v, t], dim=1)  # (B, 2D)
-
-        else:
-            raise ValueError(f"Unknown fusion type: {self.fusion}")
-
-        logits = self.classifier(x)  # (B, num_classes)
-
+        x = torch.cat([attn_feat, pooled_txt, pooled_img], dim=1)  # (B, 3*embed_dim)
+        logits = self.classifier(x)
         if return_embeddings:
-            return logits, image_emb, text_emb
+            return logits, pooled_img, pooled_txt
         return logits
 
     # Convenience wrappers for single-modality inference
