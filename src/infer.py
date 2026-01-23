@@ -7,13 +7,21 @@ from torch.utils.data import DataLoader
 from datasets import TestDataset, collate_fn_infer
 from transform import build_image_transforms, TokenizerWrapper
 from model import LateFusionClassifier
-from utils import get_device, load_checkpoint, ensure_dir
+from utils import get_device, ensure_dir
 
 def load_test_guids(test_txt_path):
-    df = pd.read_csv(test_txt_path, dtype={"guid": str})
-    if "guid" not in df.columns:
-        raise ValueError("test_without_label.txt must contain a 'guid' column")
-    return df
+    """Load test guids with encoding fallback (utf-8 -> gbk -> latin-1)"""
+    for encoding in ['utf-8', 'gbk', 'latin-1']:
+        try:
+            df = pd.read_csv(test_txt_path, dtype={"guid": str}, encoding=encoding)
+            if "guid" not in df.columns:
+                raise ValueError("test_without_label.txt must contain a 'guid' column")
+            print(f"Successfully loaded {test_txt_path} with encoding: {encoding}")
+            return df
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    
+    raise ValueError(f"Cannot decode {test_txt_path} with any known encoding (utf-8/gbk/latin-1)")
 
 def main(args):
     device = get_device()
@@ -24,9 +32,29 @@ def main(args):
     guid_list = df_test["guid"].tolist()
     print(f"Loaded {len(guid_list)} test samples")
 
+    # Load checkpoint and extract training hyperparameters
+    print(f"Loading checkpoint: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    
+    if "args" in ckpt:
+        train_args = ckpt["args"]
+        hidden_dim = train_args.get("hidden_dim", 512)
+        hidden_dim2 = train_args.get("hidden_dim2", 128)
+        dropout = train_args.get("dropout", 0.5)
+        fusion = train_args.get("fusion", "concat")
+        clip_model = train_args.get("clip_model", args.clip_model)
+        print(f"Restored hyperparameters: hidden_dim={hidden_dim}, hidden_dim2={hidden_dim2}, dropout={dropout}, fusion={fusion}")
+    else:
+        print("Warning: checkpoint missing 'args' field, using defaults")
+        hidden_dim = 512
+        hidden_dim2 = 128
+        dropout = 0.5
+        fusion = "concat"
+        clip_model = args.clip_model
+
     # Tokenizer
     tok_wrapper = TokenizerWrapper(
-        model_name_or_path=args.clip_model,
+        model_name_or_path=clip_model,
         max_length=args.max_text_len,
         device=device
     )
@@ -51,26 +79,29 @@ def main(args):
         pin_memory=True
     )
 
-    # Load model
+    # Build model with restored hyperparameters
     model = LateFusionClassifier(
-        clip_model_name=args.clip_model,
+        clip_model_name=clip_model,
+        hidden_dims=(hidden_dim, hidden_dim2),
+        dropout=dropout,
         freeze_clip=False,
-        num_classes=3
+        num_classes=3,
+        fusion=fusion
     )
     model.to(device)
 
-    # Load checkpoint
-    print(f"Loading checkpoint: {args.checkpoint}")
-    ckpt = load_checkpoint(args.checkpoint, model=model, device=device)
+    # Load model weights
+    model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
+    print("Model loaded successfully")
 
     # Label mapping
     id2label = {0: "negative", 1: "neutral", 2: "positive"}
 
     # Inference loop
     all_preds = []
-    all_guids = []
 
+    print("Starting inference...")
     with torch.no_grad():
         for batch in test_loader:
             images = batch["image"].to(device)
@@ -79,9 +110,7 @@ def main(args):
 
             logits = model(image=images, input_ids=input_ids, attention_mask=attention_mask)
             preds = torch.argmax(logits, dim=1).cpu().tolist()
-
             all_preds.extend(preds)
-            all_guids.extend(batch["guids"])
 
     # Build submission DataFrame
     df_out = df_test.copy()
@@ -91,6 +120,7 @@ def main(args):
     ensure_dir(os.path.dirname(args.output_path) or ".")
     df_out.to_csv(args.output_path, index=False)
     print(f"Saved predictions to {args.output_path}")
+    print(f"Prediction distribution: {df_out['tag'].value_counts().to_dict()}")
 
 
 if __name__ == "__main__":

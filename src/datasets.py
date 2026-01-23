@@ -10,16 +10,13 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 
-# -------------------------
+
 # Config / Label mapping
-# -------------------------
 LABEL2ID = {"negative": 0, "neutral": 1, "positive": 2}
 ID2LABEL = {v: k for k, v in LABEL2ID.items()}
 
-
-# -------------------------
 # Text cleaning util
-# -------------------------
+
 def clean_text(text: str) -> str:
     """Basic social-text cleaning: remove urls, mentions, split hashtags, normalize whitespace."""
     if text is None:
@@ -38,9 +35,8 @@ def clean_text(text: str) -> str:
     return text
 
 
-# -------------------------
+
 # Data loading & splitting
-# -------------------------
 def read_metadata(train_txt_path: str) -> pd.DataFrame:
     """
     Read train.txt which has columns: guid,tag
@@ -106,9 +102,8 @@ def check_data_consistency(df: pd.DataFrame, data_dir: str, img_exts: List[str] 
     return pd.DataFrame(ok_rows).reset_index(drop=True)
 
 
-# -------------------------
+
 # Dataset classes
-# -------------------------
 class MultiModalDataset(Dataset):
     """
     Dataset for train/val. Expects:
@@ -212,9 +207,17 @@ class TestDataset(Dataset):
         p = os.path.join(self.data_dir, guid + ".txt")
         if not os.path.exists(p):
             return ""
-        with open(p, "r", encoding="utf-8") as f:
-            text = f.read()
-        return clean_text(text)
+        
+        for encoding in ['utf-8', 'gbk', 'latin-1']:
+            try:
+                with open(p, "r", encoding=encoding) as f:
+                    text = f.read()
+                return clean_text(text)
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        
+        print(f"Warning: Cannot decode {p} with any encoding, using empty text")
+        return ""
 
     def __getitem__(self, idx):
         guid = self.guid_list[idx]
@@ -235,9 +238,7 @@ class TestDataset(Dataset):
         }
 
 
-# -------------------------
 # Collate fn for DataLoader
-# -------------------------
 def collate_fn(batch):
     """
     Batch is a list of dicts from MultiModalDataset.
@@ -270,9 +271,6 @@ def collate_fn_infer(batch):
     }
 
 
-# -------------------------
-# Convenience: build dataloaders
-# -------------------------
 def get_dataloaders(train_txt_path: str,
                     data_dir: str,
                     tokenizer,
@@ -308,11 +306,9 @@ def get_dataloaders(train_txt_path: str,
     return train_loader, val_loader, test_loader, (train_df, val_df, test_df)
 
 
-# -------------------------
-# Example usage snippet (to be used in train.py)
-# -------------------------
+
 if __name__ == "__main__":
-    # Example (not executed during import)
+    # Test example (not executed during import)
     from torchvision import transforms
     from transformers import CLIPTokenizerFast
 

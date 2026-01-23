@@ -1,4 +1,3 @@
-# src/train.py
 import os
 import argparse
 import json
@@ -14,7 +13,7 @@ import pandas as pd
 
 from transformers import CLIPTokenizerFast
 
-from datasets import get_dataloaders, LABEL2ID, ID2LABEL
+from datasets import get_dataloaders, LABEL2ID, ID2LABEL, MultiModalDataset, collate_fn
 from transform import build_image_transforms, TokenizerWrapper
 from model import LateFusionClassifier
 from utils import set_seed, get_device, setup_logger, compute_metrics, save_checkpoint, plot_training_curves, append_metrics_to_csv, ensure_dir
@@ -22,7 +21,7 @@ from utils import set_seed, get_device, setup_logger, compute_metrics, save_chec
 # -------------------------
 # Training / Validation Step
 # -------------------------
-def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler=None):
+def train_one_epoch(model, dataloader, criterion, optimizer, device, input_mode: str = "multimodal", scaler=None):
     model.train()
     total_loss = 0.0
     all_preds = []
@@ -35,13 +34,18 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler=None
         labels = batch["label"].to(device)
 
         optimizer.zero_grad()
-        # forward
-        logits = model(image=images, input_ids=input_ids, attention_mask=attention_mask)
+        if input_mode == "text_only":
+            logits = model(image=None, input_ids=input_ids, attention_mask=attention_mask)
+        elif input_mode == "image_only":
+            logits = model(image=images, input_ids=None, attention_mask=None)
+        else:
+            logits = model(image=images, input_ids=input_ids, attention_mask=attention_mask)
+
         loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * images.size(0)
+        total_loss += loss.item() * labels.size(0)
         preds = torch.argmax(logits, dim=1).detach().cpu().tolist()
         all_preds.extend(preds)
         all_labels.extend(labels.detach().cpu().tolist())
@@ -51,7 +55,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler=None
     return avg_loss, metrics
 
 
-def validate(model, dataloader, criterion, device):
+def validate(model, dataloader, criterion, device, input_mode: str = "multimodal"):
     model.eval()
     total_loss = 0.0
     all_preds = []
@@ -63,10 +67,15 @@ def validate(model, dataloader, criterion, device):
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["label"].to(device)
 
-            logits = model(image=images, input_ids=input_ids, attention_mask=attention_mask)
+            if input_mode == "text_only":
+                logits = model(image=None, input_ids=input_ids, attention_mask=attention_mask)
+            elif input_mode == "image_only":
+                logits = model(image=images, input_ids=None, attention_mask=None)
+            else:
+                logits = model(image=images, input_ids=input_ids, attention_mask=attention_mask)
             loss = criterion(logits, labels)
 
-            total_loss += loss.item() * images.size(0)
+            total_loss += loss.item() * labels.size(0)
             preds = torch.argmax(logits, dim=1).detach().cpu().tolist()
             all_preds.extend(preds)
             all_labels.extend(labels.detach().cpu().tolist())
@@ -120,13 +129,45 @@ def _build_optimizer(model: LateFusionClassifier, lr_head: float, lr_clip: float
 
     return AdamW(param_groups, weight_decay=weight_decay)
 
-# -------------------------
-# Main training loop
-# -------------------------
+def _build_dataloaders_from_split_dir(
+    split_dir: str,
+    data_dir: str,
+    tokenizer,
+    image_transform_train,
+    image_transform_eval,
+    batch_size: int,
+    num_workers: int,
+    max_text_len: int,
+):
+    split_dir = os.path.abspath(split_dir)
+    train_csv = os.path.join(split_dir, "train_split.csv")
+    val_csv = os.path.join(split_dir, "val_split.csv")
+    test_csv = os.path.join(split_dir, "test_split.csv")
+    for p in (train_csv, val_csv, test_csv):
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Missing split file: {p}")
+
+    train_df = pd.read_csv(train_csv, dtype={"guid": str})
+    val_df = pd.read_csv(val_csv, dtype={"guid": str})
+    test_df = pd.read_csv(test_csv, dtype={"guid": str})
+
+    train_ds = MultiModalDataset(train_df, data_dir, tokenizer, image_transform_train, max_text_len=max_text_len)
+    val_ds = MultiModalDataset(val_df, data_dir, tokenizer, image_transform_eval, max_text_len=max_text_len)
+    test_ds = MultiModalDataset(test_df, data_dir, tokenizer, image_transform_eval, max_text_len=max_text_len)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, collate_fn=collate_fn, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, collate_fn=collate_fn, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=num_workers, collate_fn=collate_fn, pin_memory=True)
+
+    return train_loader, val_loader, test_loader, (train_df, val_df, test_df)
+
 def main(args):
     # prepare output dirs & logger
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(args.output_dir, f"run_{timestamp}")
+    out_dir = args.run_dir if args.run_dir is not None else os.path.join(args.output_dir, f"run_{timestamp}")
     ensure_dir(out_dir)
     logger = setup_logger(log_file=os.path.join(out_dir, "train.log"))
     logger.info("Output dir: %s", out_dir)
@@ -149,27 +190,61 @@ def main(args):
     image_transform_eval = build_image_transforms(image_size=args.image_size, train=False)
 
     # dataloaders
-    train_loader, val_loader, test_loader, splits = get_dataloaders(
-        train_txt_path=args.train_txt,
-        data_dir=args.data_dir,
-        tokenizer=tok_wrapper.tokenizer,  # datasets expects HF tokenizer directly
-        image_transform_train=image_transform_train,
-        image_transform_eval=image_transform_eval,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        val_size=args.val_size,
-        test_size=args.test_size,
-        num_workers=args.num_workers
-    )
-    train_df, val_df, test_df = splits
-    logger.info("Dataset sizes - train: %d, val: %d, test(split): %d", len(train_df), len(val_df), len(test_df))
-    
-    split_dir = os.path.join(out_dir, "splits") 
-    ensure_dir(split_dir) 
-    train_df.to_csv(os.path.join(split_dir, "train_split.csv"), index=False) 
-    val_df.to_csv(os.path.join(split_dir, "val_split.csv"), index=False) 
-    test_df.to_csv(os.path.join(split_dir, "test_split.csv"), index=False) 
-    logger.info("Saved dataset splits to %s", split_dir)
+    if args.split_dir is not None:
+        train_loader, val_loader, test_loader, splits = _build_dataloaders_from_split_dir(
+            split_dir=args.split_dir,
+            data_dir=args.data_dir,
+            tokenizer=tok_wrapper.tokenizer,
+            image_transform_train=image_transform_train,
+            image_transform_eval=image_transform_eval,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            max_text_len=args.max_text_len,
+        )
+        train_df, val_df, test_df = splits
+        logger.info("Loaded splits from %s", os.path.abspath(args.split_dir))
+    else:
+        if args.val_size == 0.0 and args.test_size == 0.0:
+            logger.info("Full training mode: using all data for training (no validation split)")
+            
+            train_df = pd.read_csv(args.train_txt, dtype={"guid": str})
+            val_df = pd.DataFrame(columns=train_df.columns)  
+            test_df = pd.DataFrame(columns=train_df.columns)  
+            
+            from datasets import MultiModalDataset
+            train_ds = MultiModalDataset(train_df, args.data_dir, tok_wrapper.tokenizer, 
+                                        image_transform_train, max_text_len=args.max_text_len)
+            train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                    num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True)
+            val_loader = None  
+            test_loader = None
+            
+            logger.info(f"Full dataset: {len(train_df)} samples")
+            
+            # 不保存 splits（因为没有划分）
+            splits = (train_df, val_df, test_df)
+        else:
+            train_loader, val_loader, test_loader, splits = get_dataloaders(
+                train_txt_path=args.train_txt,
+                data_dir=args.data_dir,
+                tokenizer=tok_wrapper.tokenizer,  # HF tokenizer 
+                image_transform_train=image_transform_train,
+                image_transform_eval=image_transform_eval,
+                batch_size=args.batch_size,
+                seed=args.seed,
+                val_size=args.val_size,
+                test_size=args.test_size,
+                num_workers=args.num_workers
+            )
+            train_df, val_df, test_df = splits
+            logger.info("Dataset sizes - train: %d, val: %d, test(split): %d", len(train_df), len(val_df), len(test_df))
+            
+            split_dir = os.path.join(out_dir, "splits") 
+            ensure_dir(split_dir) 
+            train_df.to_csv(os.path.join(split_dir, "train_split.csv"), index=False) 
+            val_df.to_csv(os.path.join(split_dir, "val_split.csv"), index=False) 
+            test_df.to_csv(os.path.join(split_dir, "test_split.csv"), index=False) 
+            logger.info("Saved dataset splits to %s", split_dir)
     
 
     # model
@@ -211,47 +286,60 @@ def main(args):
 
         for epoch in range(start_epoch, max_epoch + 1):
             logger.info("[%s] Epoch %d/%d", stage_name, epoch, max_epoch)
+            train_loss, train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device, input_mode=args.input_mode)
+            
+            if val_loader is not None:
+                val_loss, val_metrics = validate(model, val_loader, criterion, device, input_mode=args.input_mode)
 
-            train_loss, train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device)
-            val_loss, val_metrics = validate(model, val_loader, criterion, device)
+                logger.info("[%s] Train loss: %.4f | Train macro_f1: %.4f | Val loss: %.4f | Val macro_f1: %.4f",
+                            stage_name, train_loss, train_metrics["macro_f1"], val_loss, val_metrics["macro_f1"])
 
-            logger.info("[%s] Train loss: %.4f | Train macro_f1: %.4f | Val loss: %.4f | Val macro_f1: %.4f",
-                        stage_name, train_loss, train_metrics["macro_f1"], val_loss, val_metrics["macro_f1"])
+                history[f"{stage_name}_train_loss"].append(train_loss)
+                history[f"{stage_name}_val_loss"].append(val_loss)
+                history[f"{stage_name}_train_macro_f1"].append(train_metrics["macro_f1"])
+                history[f"{stage_name}_val_macro_f1"].append(val_metrics["macro_f1"])
 
-            history[f"{stage_name}_train_loss"].append(train_loss)
-            history[f"{stage_name}_val_loss"].append(val_loss)
-            history[f"{stage_name}_train_macro_f1"].append(train_metrics["macro_f1"])
-            history[f"{stage_name}_val_macro_f1"].append(val_metrics["macro_f1"])
+                scheduler.step(val_metrics["macro_f1"])
 
-            scheduler.step(val_metrics["macro_f1"])
+                if val_metrics["macro_f1"] > best_val_macro:
+                    best_val_macro = val_metrics["macro_f1"]
+                    best_epoch = epoch
+                    patience_counter = 0
 
-            if val_metrics["macro_f1"] > best_val_macro:
-                best_val_macro = val_metrics["macro_f1"]
-                best_epoch = epoch
-                patience_counter = 0
+                    save_checkpoint({
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "val_macro_f1": val_metrics["macro_f1"],
+                        "args": vars(args)
+                    }, checkpoint_dir=out_dir, filename="best_checkpoint.pth")
+                    logger.info("[%s] Saved new best checkpoint (epoch %d, val_macro_f1 %.4f)",
+                                stage_name, epoch, val_metrics["macro_f1"])
+                else:
+                    patience_counter += 1
+                    logger.info("[%s] No improvement. Patience %d/%d", stage_name, patience_counter, args.early_stop_patience)
 
+                if patience_counter >= args.early_stop_patience:
+                    logger.info("[%s] Early stopping triggered. Best epoch so far: %d (val_macro_f1=%.4f)",
+                                stage_name, best_epoch, best_val_macro)
+                    break
+            else:
+                logger.info("[%s] Train loss: %.4f | Train F1: %.4f (no validation)",
+                        stage_name, train_loss, train_metrics["macro_f1"])
+            
+            # 保存最后一个 epoch 的模型
+            if epoch == max_epoch:
                 save_checkpoint({
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "val_macro_f1": val_metrics["macro_f1"],
+                    "train_macro_f1": train_metrics["macro_f1"],
                     "args": vars(args)
-                }, checkpoint_dir=out_dir, filename="best_checkpoint.pth")
-                logger.info("[%s] Saved new best checkpoint (epoch %d, val_macro_f1 %.4f)",
-                            stage_name, epoch, val_metrics["macro_f1"])
-            else:
-                patience_counter += 1
-                logger.info("[%s] No improvement. Patience %d/%d", stage_name, patience_counter, args.early_stop_patience)
+                }, checkpoint_dir=out_dir, filename="final_checkpoint.pth")
+                logger.info("[%s] Saved final checkpoint (epoch %d)", stage_name, epoch)
 
-            if patience_counter >= args.early_stop_patience:
-                logger.info("[%s] Early stopping triggered. Best epoch so far: %d (val_macro_f1=%.4f)",
-                            stage_name, best_epoch, best_val_macro)
-                break
-
-    # ----------------
     # Stage 1 (freeze)
-    # ----------------
     if args.two_stage:
         logger.info("Two-stage training enabled.")
         logger.info("Stage1: freeze CLIP, train head only for %d epoch(s).", args.stage1_epochs)
@@ -262,19 +350,27 @@ def main(args):
         stage1_best = os.path.join(out_dir, "stage1_best_checkpoint.pth")
         try:
             import shutil
-            shutil.copyfile(os.path.join(out_dir, "best_checkpoint.pth"), stage1_best)
-            logger.info("Copied stage1 best checkpoint to %s", stage1_best)
+            if os.path.exists(os.path.join(out_dir, "best_checkpoint.pth")):
+                shutil.copyfile(os.path.join(out_dir, "best_checkpoint.pth"), stage1_best)
+                logger.info("Copied stage1 best checkpoint to %s", stage1_best)
+            else:
+                logger.info("No best_checkpoint.pth (full training mode), skipping copy.")
         except Exception as e:
             logger.warning("Could not copy stage1 best checkpoint: %s", str(e))
 
-        # ----------------
         # Stage 2 (unfreeze)
-        # ----------------
-        # Reset early-stopping counter for stage2 to avoid stopping immediately
         patience_counter = 0
-
         # Load best weights before finetuning further
-        ckpt = torch.load(os.path.join(out_dir, "best_checkpoint.pth"), map_location=device)
+        if os.path.exists(os.path.join(out_dir, "best_checkpoint.pth")):
+            ckpt_path = os.path.join(out_dir, "best_checkpoint.pth")
+            logger.info("Loading best_checkpoint.pth before Stage2 finetune.")
+        elif os.path.exists(os.path.join(out_dir, "final_checkpoint.pth")):
+            ckpt_path = os.path.join(out_dir, "final_checkpoint.pth")
+            logger.info("Loading final_checkpoint.pth before Stage2 finetune (full training mode).")
+        else:
+            raise FileNotFoundError("No checkpoint found to resume Stage2!")
+        
+        ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
         logger.info("Loaded best checkpoint before Stage2 finetune.")
 
@@ -310,27 +406,33 @@ def main(args):
         _run_epochs(start_epoch=1, max_epoch=args.epochs, stage_name="train")
 
     # finalize: save history and plot curves
-    if args.two_stage:
-        history["train_loss"] = history.get("stage1_train_loss", []) + history.get("stage2_train_loss", [])
-        history["val_loss"] = history.get("stage1_val_loss", []) + history.get("stage2_val_loss", [])
-        history["train_macro_f1"] = history.get("stage1_train_macro_f1", []) + history.get("stage2_train_macro_f1", [])
-        history["val_macro_f1"] = history.get("stage1_val_macro_f1", []) + history.get("stage2_val_macro_f1", [])
-    
-    plot_path = os.path.join(out_dir, "training_curves.png")
-    plot_training_curves(history, plot_path)
-    logger.info("Saved training curves to %s", plot_path)
+    if val_loader is not None:
+        if args.two_stage:
+            history["train_loss"] = history.get("stage1_train_loss", []) + history.get("stage2_train_loss", [])
+            history["val_loss"] = history.get("stage1_val_loss", []) + history.get("stage2_val_loss", [])
+            history["train_macro_f1"] = history.get("stage1_train_macro_f1", []) + history.get("stage2_train_macro_f1", [])
+            history["val_macro_f1"] = history.get("stage1_val_macro_f1", []) + history.get("stage2_val_macro_f1", [])
+        
+        plot_path = os.path.join(out_dir, "training_curves.png")
+        plot_training_curves(history, plot_path)
+        logger.info("Saved training curves to %s", plot_path)
+    else:
+        logger.info("Skipping training curves (no validation data)")
 
     # save metrics CSV
     metrics_csv = os.path.join(out_dir, "val_metrics.csv")
-    append_metrics_to_csv(metrics_csv, {
-        "best_epoch": best_epoch,
-        "best_val_macro_f1": best_val_macro,
-        "train_size": len(train_df),
-        "val_size": len(val_df),
-        "test_split_size": len(test_df),
-        "seed": args.seed
-    }, fieldnames=["best_epoch", "best_val_macro_f1", "train_size", "val_size", "test_split_size", "seed"])
-    logger.info("Saved summary metrics to %s", metrics_csv)
+    if val_loader is not None:
+        append_metrics_to_csv(metrics_csv, {
+            "best_epoch": best_epoch,
+            "best_val_macro_f1": best_val_macro,
+            "train_size": len(train_df),
+            "val_size": len(val_df),
+            "test_split_size": len(test_df),
+            "seed": args.seed
+        }, fieldnames=["best_epoch", "best_val_macro_f1", "train_size", "val_size", "test_split_size", "seed"])
+        logger.info("Saved summary metrics to %s", metrics_csv)
+    else:
+        logger.info("Skipping val_metrics.csv (no validation data)")
 
     logger.info("Training finished. Best epoch: %d, Best val macro_f1: %.4f", best_epoch, best_val_macro)
 
@@ -340,8 +442,12 @@ if __name__ == "__main__":
     parser.add_argument("--train_txt", type=str, default="./data/train.txt", help="Path to train.txt (guid,tag)")
     parser.add_argument("--data_dir", type=str, default="./data/data", help="Directory with guid.jpg and guid.txt files")
     parser.add_argument("--clip_model", type=str, default="openai/clip-vit-base-patch32", help="HF CLIP model id")
-    parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save checkpoints and logs")
     parser.add_argument("--image_size", type=int, default=224, help="Image size for CLIP transforms")
+    parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save checkpoints and logs")
+    parser.add_argument("--run_dir", type=str, default=None, help="If set, write outputs to this directory (useful for ablations).")
+    parser.add_argument("--split_dir", type=str, default=None, help="If set, reuse existing splits (train_split.csv/val_split.csv/test_split.csv).")
+    parser.add_argument("--input_mode", type=str, default="multimodal", choices=["multimodal", "text_only", "image_only"],
+                        help="Ablation: train/eval with both modalities, text only, or image only.")
     parser.add_argument("--max_text_len", type=int, default=77, help="Max token length for text")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--epochs", type=int, default=20, help="Max epochs")
