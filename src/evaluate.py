@@ -17,7 +17,6 @@ from utils import (
 )
 
 def _load_run_hparams(checkpoint_path: str) -> dict:
-    """Load hyperparameters from checkpoint['args'] or sibling hparams.json."""
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     if isinstance(ckpt, dict) and "args" in ckpt and isinstance(ckpt["args"], dict):
         return ckpt["args"]

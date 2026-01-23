@@ -25,14 +25,9 @@ from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_sc
 import matplotlib.pyplot as plt
 
 
-# -------------------------
-# Reproducibility & device
-# -------------------------
+
+# Reproducibility 
 def set_seed(seed: int = 42, deterministic: bool = True) -> None:
-    """
-    Set random seed for python, numpy and torch for reproducibility.
-    If deterministic=True, also set cudnn to deterministic mode (may slow down).
-    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -43,24 +38,12 @@ def set_seed(seed: int = 42, deterministic: bool = True) -> None:
 
 
 def get_device(prefer_gpu: bool = True) -> torch.device:
-    """
-    Return torch.device: cuda if available and prefer_gpu True, else cpu.
-    """
     if prefer_gpu and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
 
-
-# -------------------------
 # Metrics
-# -------------------------
 def compute_metrics(y_true: List[int], y_pred: List[int], labels: Optional[List[int]] = None) -> Dict[str, Any]:
-    """
-    Compute classification metrics.
-    Returns dict with: accuracy, macro_f1, per_class_f1 (dict), precision_macro, recall_macro, confusion_matrix (ndarray).
-    y_true, y_pred: lists or 1D arrays of ints.
-    labels: optional list of label indices to pass to sklearn (ensures consistent ordering).
-    """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     if labels is None:
@@ -82,16 +65,8 @@ def compute_metrics(y_true: List[int], y_pred: List[int], labels: Optional[List[
     return metrics
 
 
-# -------------------------
 # Checkpoint helpers
-# -------------------------
 def save_checkpoint(state: Dict[str, Any], checkpoint_dir: str, filename: str = "checkpoint.pth"):
-    """
-    Save training checkpoint.
-    state: dict containing at least {'epoch', 'model_state_dict', 'optimizer_state_dict', 'scheduler_state_dict' (opt)}.
-    checkpoint_dir: directory to save into (created if not exists).
-    filename: file name for the checkpoint.
-    """
     os.makedirs(checkpoint_dir, exist_ok=True)
     path = os.path.join(checkpoint_dir, filename)
     torch.save(state, path)
@@ -99,11 +74,6 @@ def save_checkpoint(state: Dict[str, Any], checkpoint_dir: str, filename: str = 
 
 def load_checkpoint(path: str, model: Optional[nn.Module] = None, optimizer: Optional[torch.optim.Optimizer] = None,
                     scheduler: Optional[Any] = None, device: Optional[torch.device] = None) -> Dict[str, Any]:
-    """
-    Load checkpoint and optionally restore model/optimizer/scheduler states.
-    Returns the checkpoint dict.
-    If model/optimizer/scheduler provided, their states will be loaded in-place.
-    """
     if device is None:
         device = get_device()
     checkpoint = torch.load(path, map_location=device)
@@ -120,9 +90,7 @@ def load_checkpoint(path: str, model: Optional[nn.Module] = None, optimizer: Opt
     return checkpoint
 
 
-# -------------------------
 # AverageMeter for tracking
-# -------------------------
 class AverageMeter:
     """
     Computes and stores the average and current value.
@@ -143,10 +111,7 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / self.count if self.count != 0 else 0.0
 
-
-# -------------------------
 # Simple logger & CSV writer
-# -------------------------
 def setup_logger(log_file: Optional[str] = None, level: int = logging.INFO) -> logging.Logger:
     """
     Setup a logger that prints to stdout and optionally writes to a file.
@@ -167,11 +132,7 @@ def setup_logger(log_file: Optional[str] = None, level: int = logging.INFO) -> l
             logger.addHandler(fh)
     return logger
 
-
 def append_metrics_to_csv(csv_path: str, row: Dict[str, Any], fieldnames: Optional[List[str]] = None):
-    """
-    Append a row (dict) to a CSV file. If file doesn't exist, create it and write header.
-    """
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
     write_header = not os.path.exists(csv_path)
     if fieldnames is None:
@@ -183,14 +144,9 @@ def append_metrics_to_csv(csv_path: str, row: Dict[str, Any], fieldnames: Option
         writer.writerow(row)
 
 
-# -------------------------
+
 # Plotting training curves
-# -------------------------
 def plot_training_curves(history: Dict[str, List[float]], out_path: str):
-    """
-    history: dict with keys like 'train_loss','val_loss','train_macro_f1','val_macro_f1' mapping to lists per epoch.
-    Saves a PNG with loss and metric curves side by side.
-    """
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     def _epochs_for(key: str):
@@ -224,9 +180,7 @@ def plot_training_curves(history: Dict[str, List[float]], out_path: str):
     plt.savefig(out_path, dpi=150)
     plt.close()
 
-# -------------------------
 # Small helpers
-# -------------------------
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
@@ -264,9 +218,8 @@ def load_json(path: str) -> Any:
         return json.load(f)
 
 
-# -------------------------
-# Example usage (not executed on import)
-# -------------------------
+# Test Example (not executed on import)
+
 if __name__ == "__main__":
     set_seed(42)
     device = get_device()

@@ -18,9 +18,7 @@ from transform import build_image_transforms, TokenizerWrapper
 from model import LateFusionClassifier
 from utils import set_seed, get_device, setup_logger, compute_metrics, save_checkpoint, plot_training_curves, append_metrics_to_csv, ensure_dir
 
-# -------------------------
 # Training / Validation Step
-# -------------------------
 def train_one_epoch(model, dataloader, criterion, optimizer, device, input_mode: str = "multimodal", scaler=None):
     model.train()
     total_loss = 0.0
